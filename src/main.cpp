@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <avr/interrupt.h>
 
 // ===================== Pins =====================
 const int TX_PIN       = 11;   // D11 = OC2A, Timer2 40 kHz output
@@ -21,10 +22,13 @@ const int ZERO_OFFSET_TICKS = 0;
 // ===================== ISR shared variables =====================
 volatile uint16_t refTickISR = 0;
 volatile uint16_t rxTickISR  = 0;
+volatile int16_t phaseDeltaTicksISR = 0;
 
 volatile bool haveRef = false;
 volatile bool haveRx  = false;
-volatile bool newRxEdge = false;
+volatile bool newPhase = false;
+
+volatile uint8_t lastPindISR = 0;
 
 // ===================== Generate 40 kHz on D11 =====================
 void start40kHzOnD11() {
@@ -69,16 +73,47 @@ int wrapToSignedPeriod(int ticks) {
   return ticks;
 }
 
-// ===================== Interrupts =====================
-void refISR() {
-  refTickISR = TCNT1;
-  haveRef = true;
+// ===================== Pin-change timestamping =====================
+void startD2D3PinChangeInterrupts() {
+  noInterrupts();
+
+  lastPindISR = PIND;
+
+  // D2 = PD2 = PCINT18, D3 = PD3 = PCINT19. They share the PCINT2 vector,
+  // so simultaneous edges are timestamped once instead of being delayed by
+  // external-interrupt priority between INT0 and INT1.
+  PCIFR  |= (1 << PCIF2);                       // clear pending flag
+  PCICR  |= (1 << PCIE2);                       // enable Port D pin changes
+  PCMSK2 |= (1 << PCINT18) | (1 << PCINT19);    // watch D2 and D3 only
+
+  interrupts();
 }
 
-void rxISR() {
-  rxTickISR = TCNT1;
-  haveRx = true;
-  newRxEdge = true;
+ISR(PCINT2_vect) {
+  uint16_t now = TCNT1;
+  uint8_t pindNow = PIND;
+  uint8_t changed = pindNow ^ lastPindISR;
+  uint8_t rising = changed & pindNow;
+
+  lastPindISR = pindNow;
+
+  bool refRise = rising & (1 << PD3);
+  bool rxRise  = rising & (1 << PD2);
+
+  if (refRise) {
+    refTickISR = now;
+    haveRef = true;
+  }
+
+  if (rxRise) {
+    rxTickISR = now;
+    haveRx = true;
+
+    if (haveRef) {
+      phaseDeltaTicksISR = (int16_t)(rxTickISR - refTickISR);
+      newPhase = true;
+    }
+  }
 }
 
 // ===================== Envelope averaging =====================
@@ -105,8 +140,7 @@ void setup() {
   startTimer1FreeRunning();
   start40kHzOnD11();
 
-  attachInterrupt(digitalPinToInterrupt(REF_PIN), refISR, RISING);
-  attachInterrupt(digitalPinToInterrupt(PHASE_RX_PIN), rxISR, RISING);
+  startD2D3PinChangeInterrupts();
 
   Serial.println("Timestamp phase measurement");
   Serial.println("raw, avg, Venv, refPhase, rxPhase, deltaTicks, rawPhaseTicks, correctedTicks, dt_us, phase_deg");
@@ -122,45 +156,42 @@ void loop() {
   // -------- Copy phase timestamps atomically --------
   uint16_t refTickLocal;
   uint16_t rxTickLocal;
+  int16_t deltaTicksLocal;
   bool localHaveRef;
   bool localHaveRx;
-  bool localNewRx;
+  bool localNewPhase;
 
   noInterrupts();
   refTickLocal = refTickISR;
   rxTickLocal  = rxTickISR;
+  deltaTicksLocal = phaseDeltaTicksISR;
 
   localHaveRef = haveRef;
   localHaveRx  = haveRx;
-  localNewRx   = newRxEdge;
+  localNewPhase = newPhase;
 
-  newRxEdge = false;
+  newPhase = false;
   interrupts();
 
-  Serial.print("raw=");
-  Serial.print(raw);
+  //Serial.print("raw=");
+  //Serial.print(raw);
 
-  Serial.print(", avg=");
-  Serial.print(avg);
+  //Serial.print(", avg=");
+  //Serial.print(avg);
 
-  Serial.print(", Venv=");
-  Serial.print(voltage, 3);
-  Serial.print(" V");
+  //Serial.print(", Venv=");
+  //Serial.print(voltage, 3);
+  //Serial.print(" V");
 
-  if (localHaveRef && localHaveRx && localNewRx) {
+  if (localHaveRef && localHaveRx && localNewPhase) {
     // Convert both timestamps to phase within one 40 kHz period.
     // These are only for debugging; do not subtract them directly because
     // Timer1 overflows every 65536 ticks, and 65536 is not a multiple of 400.
     int refPhaseTicks = refTickLocal % PERIOD_TICKS;
     int rxPhaseTicks  = rxTickLocal  % PERIOD_TICKS;
 
-    // First subtract the raw Timer1 timestamps. uint16_t subtraction handles
-    // one Timer1 overflow correctly as long as the two edges are less than
-    // 65536 ticks apart.
-    uint16_t deltaTicks = rxTickLocal - refTickLocal;
-
-    // Then fold the elapsed time into one 40 kHz period.
-    int rawPhaseTicks = deltaTicks % PERIOD_TICKS;
+    // Fold the signed elapsed time into one 40 kHz period.
+    int rawPhaseTicks = wrapToSignedPeriod(deltaTicksLocal);
     rawPhaseTicks = wrapToSignedPeriod(rawPhaseTicks);
 
     // Apply calibration offset
@@ -177,7 +208,7 @@ void loop() {
     Serial.print(rxPhaseTicks);
 
     Serial.print(", deltaTicks=");
-    Serial.print(deltaTicks);
+    Serial.print(deltaTicksLocal);
 
     Serial.print(", rawPhaseTicks=");
     Serial.print(rawPhaseTicks);
@@ -196,5 +227,5 @@ void loop() {
     Serial.println(", no phase");
   }
 
-  delay(20);
+  delay(200);
 }
