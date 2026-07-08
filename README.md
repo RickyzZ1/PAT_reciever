@@ -247,53 +247,7 @@ Ctrl + A, then Ctrl + X
 
 ---
 
-## 6. Code integration
-
-Paste the contents of `stm32_main_user_code_sections.c` into the matching `USER CODE` blocks in `Core/Src/main.c`.
-
-Important: keep helper functions outside `main()`.
-
-Correct structure:
-
-```c
-int main(void)
-{
-    ...
-    while (1)
-    {
-        ...
-    }
-}
-
-/* USER CODE BEGIN 4 */
-void HAL_TIM_IC_CaptureCallback(...)
-{
-}
-
-static uint8_t read_adc_pair_average(...)
-{
-}
-/* USER CODE END 4 */
-```
-
-If you get this compile error:
-
-```text
-invalid storage class for function 'read_adc_pair'
-expected declaration or statement at end of input
-```
-
-then a closing brace `}` is missing before `USER CODE BEGIN 4`.
-
-Use this command to inspect the relevant region:
-
-```bash
-nl -ba Core/Src/main.c | sed -n '90,260p'
-```
-
----
-
-## 7. Calibration constants
+## 6. Calibration constants
 
 ### Phase zero offset
 
@@ -359,7 +313,7 @@ STM32 fixed-point constants:
 
 ---
 
-## 8. Expected output
+## 7. Expected output
 
 Example output after ADC and capture are working:
 
@@ -376,7 +330,7 @@ Units:
 
 ---
 
-## 9. Quick validation checklist
+## 8. Quick validation checklist
 
 1. PA8 -> PA6 loopback:
 
