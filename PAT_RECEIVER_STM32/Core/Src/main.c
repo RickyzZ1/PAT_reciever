@@ -2,130 +2,227 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : PAT 4-channel buffered-waveform receiver
   ******************************************************************************
-  * @attention
   *
-  * STM32 PAT receiver migration user code sections
-  * Target: NUCLEO-G431KB / STM32G431KBTx
-  * CubeMX config assumed:
-  *   TIM1_CH1 PA8 PWM 40 kHz, ARR=4249, CCR1=2125, TRGO=Update Event
-  *   TIM3_CH1 PA6 Input Capture, ARR=4249, Reset Mode, Trigger=ITR0/TIM1_TRGO, IRQ enabled
-  *   ADC1 regular sequence: Rank1=ADC1_IN1/PA0, Rank2=ADC1_IN2/PA1, single-ended
-  *   USART2 PA2/PA3 115200 8N1 VCP
+  * Target:
+  *   NUCLEO-G431KB / STM32G431KBTx
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  * 40 kHz transmit/reference:
+  *   PA8 / TIM1_CH1 = 40 kHz PWM
+  *   TIM1 TRGO      = Update Event
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * Phase capture:
+  *   TIM3 slave mode = Reset Mode
+  *   TIM3 trigger    = ITR0 / TIM1_TRGO
+  *
+  *   PA6 / TIM3_CH1 = RX1 comparator
+  *   PA7 / TIM3_CH2 = RX2 comparator
+  *   PB0 / TIM3_CH3 = RX3 comparator
+  *   PB7 / TIM3_CH4 = RX4 comparator
+  *
+  * Buffered waveform ADC inputs:
+  *   PA0 / ADC1_IN1  = CH1_TO_ADC
+  *   PA1 / ADC1_IN2  = CH2_TO_ADC
+  *   PA4 / ADC2_IN17 = CH3_TO_ADC
+  *   PA5 / ADC2_IN13 = CH4_TO_ADC
+  *
+  * Each CHx_TO_ADC signal is taken after the 10k/15k divider and
+  * MCP6022 voltage follower.  The firmware reports both the voltage
+  * measured at the ADC buffer output and the estimated amplifier-output
+  * voltage restored by 5/3.
+  *
+  * ADC acquisition used by this file:
+  *   ADC1: scan 2 ranks continuously, DMA normal
+  *         rank 1 = ADC1_IN1, rank 2 = ADC1_IN2
+  *   ADC2: scan 2 ranks continuously, DMA normal
+  *         rank 1 = ADC2_IN17, rank 2 = ADC2_IN13
+  *   Software trigger, continuous conversion enabled.
+  *
+  * USART2:
+  *   PA2 / PA3, 115200 baud
   *
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
+#include "dma.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+typedef struct
+{
+  uint16_t adc_min;
+  uint16_t adc_max;
+
+  uint32_t buffer_dc_mV;
+  uint32_t buffer_rms_mV;
+  uint32_t buffer_vpp_mV;
+
+  uint32_t amp_rms_mV;
+  uint32_t amp_vpp_mV;
+
+  uint32_t pressure_cPa;
+
+  uint8_t clipping;
+} RxAmplitudeResult;
+
+typedef struct
+{
+  uint32_t raw_ticks;
+  uint32_t capture_count;
+  uint32_t capture_delta;
+
+  int32_t corrected_ticks;
+  int32_t delay_ns;
+  int32_t phase_mdeg;
+
+  uint8_t has_capture;
+  uint8_t edge_rate_valid;
+  uint8_t phase_valid;
+} RxPhaseResult;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define RX_CHANNEL_COUNT              4U
+
+/*
+ * TIM1/TIM3 timer clock = 170 MHz.
+ * 170 MHz / 40 kHz = 4250 timer ticks.
+ */
+#define PAT_PERIOD_TICKS              4250UL
+#define TIMER_CLOCK_MHZ               170L
+
+/* Per-channel phase calibration offsets. */
+#define RX1_ZERO_OFFSET_TICKS         0L
+#define RX2_ZERO_OFFSET_TICKS         0L
+#define RX3_ZERO_OFFSET_TICKS         0L
+#define RX4_ZERO_OFFSET_TICKS         0L
+
+#define REPORT_INTERVAL_MS            200UL
+#define ADC_CAPTURE_TIMEOUT_MS        50UL
+
+#define ADC_VREF_MV                   3300UL
+#define ADC_MAX_COUNTS                4095UL
+
+/*
+ * ADC1 and ADC2 each scan two ranks continuously.
+ * The DMA stream therefore contains:
+ *
+ *   ADC1: CH1, CH2, CH1, CH2, ...
+ *   ADC2: CH3, CH4, CH3, CH4, ...
+ *
+ * 2048 points per receiver channel gives a useful waveform block while
+ * staying comfortably inside the STM32G431KB SRAM budget.
+ */
+#define ADC_SAMPLES_PER_CHANNEL       2048U
+#define ADC_CHANNELS_PER_ADC          2U
+#define ADC_DMA_LENGTH                \
+    (ADC_SAMPLES_PER_CHANNEL * ADC_CHANNELS_PER_ADC)
+
+/* ADC rail checks. */
+#define ADC_CLIP_LOW_COUNTS           16U
+#define ADC_CLIP_HIGH_COUNTS          4079U
+
+/*
+ * Schematic divider before each CHx_TO_ADC buffer:
+ *
+ *   amplifier output -- 10k -- ADC-buffer node -- 15k -- GND
+ *
+ * Vbuffer = Vamp * 15 / (10 + 15) = Vamp * 3/5
+ * Vamp    = Vbuffer * 5/3
+ */
+#define ADC_DIV_RESTORE_NUMERATOR     5UL
+#define ADC_DIV_RESTORE_DENOMINATOR   3UL
+
+/*
+ * HC10T-40TR-P approximate receive sensitivity:
+ * -75 dBV/uBar ~= 1.78 mV/Pa = 1780 uV/Pa.
+ */
+#define RX_SENS_UV_PER_PA             1780UL
+
+/* MCP6022 non-inverting amplifier gain: 1 + 22k/10k = 3.2. */
+#define AMP_GAIN_X1000                3200UL
+
+/* Optional validity checks. */
+#define MIN_VALID_BUFFER_RMS_MV       5UL
+#define MIN_VALID_CAPTURE_DELTA       7000UL
+#define MAX_VALID_CAPTURE_DELTA       9000UL
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-
 /* USER CODE BEGIN PV */
 
-/* ===== PAT timing ===== */
-#define PAT_PERIOD_TICKS      4250UL     /* 170 MHz / 40 kHz = 4250 */
-#define TIMER_CLOCK_MHZ       170L       /* TIM1/TIM3 timer clock */
+static uint16_t adc1_dma_buffer[ADC_DMA_LENGTH]
+    __attribute__((aligned(4)));
 
-/*
- * In the PA8 -> PA6 loopback test, the measured raw capture was 5.
- * Use 5 as the initial zero offset.
- * Recalibrate this value when using the real receiver path.
- */
-#define ZERO_OFFSET_TICKS     5L
+static uint16_t adc2_dma_buffer[ADC_DMA_LENGTH]
+    __attribute__((aligned(4)));
 
-/* ===== ADC conversion ===== */
-#define ADC_VREF_MV           3300UL
-#define ADC_MAX_COUNTS        4095UL
+static volatile uint8_t adc1_capture_done = 0U;
+static volatile uint8_t adc2_capture_done = 0U;
+static volatile uint8_t adc1_capture_error = 0U;
+static volatile uint8_t adc2_capture_error = 0U;
 
-/*
- * PA0 envelope divider:
- *
- * envelope ---- 1M ----+---- PA0
- *                      |
- *                    470k
- *                      |
- *                     GND
- */
-#define ENV_DIV_TOP_OHM       1000000UL
-#define ENV_DIV_BOTTOM_OHM    470000UL
-
-/*
- * Zero-offset correction for envelope / bias.
- * Start with 0. If Vpeak is not zero with no signal, adjust this value.
- */
-#define PEAK_ZERO_OFFSET_MV   0L
-
-/*
- * Pressure conversion parameters.
- * Update these to match the actual transducer sensitivity and total analog gain.
- *
- * RX_SENS_UV_PER_PA:
- *   Receiver transducer sensitivity in uV/Pa
- *
- * AMP_GAIN_X1000:
- *   Total analog gain multiplied by 1000
- *   For example, use 100000 for a total gain of 100x
- */
-#define RX_SENS_UV_PER_PA     1000UL
-#define AMP_GAIN_X1000        100000UL
-
-/* ===== Input capture state ===== */
-volatile uint32_t ic1_raw_ticks = 0;
-volatile uint32_t ic1_count = 0;
-volatile uint8_t ic1_new_data = 0;
+/* TIM3_CH1..CH4 capture state for RX1..RX4. */
+static volatile uint32_t rx_raw_ticks[RX_CHANNEL_COUNT] = {0U};
+static volatile uint32_t rx_capture_count[RX_CHANNEL_COUNT] = {0U};
+static volatile uint8_t rx_new_data[RX_CHANNEL_COUNT] = {0U};
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+
 /* USER CODE BEGIN PFP */
 
-static uint8_t read_adc_pair_once(uint16_t *hold, uint16_t *bias);
-static uint8_t read_adc_pair_average(uint16_t *hold, uint16_t *bias);
+static uint8_t capture_adc_block(void);
 
-static uint32_t adc_raw_to_adc_mv(uint16_t raw);
-static uint32_t adc_raw_to_envelope_mv(uint16_t raw);
+static uint8_t analyse_interleaved_channel(
+    const uint16_t *buffer,
+    uint32_t buffer_length,
+    uint32_t channel_offset,
+    RxAmplitudeResult *result);
+
+static void snapshot_phase_state(
+    RxPhaseResult phase[RX_CHANNEL_COUNT],
+    uint32_t previous_count[RX_CHANNEL_COUNT]);
+
+static uint64_t integer_sqrt_u64(uint64_t value);
 static int32_t wrap_to_signed_period(int32_t ticks);
+static int32_t phase_zero_offset_ticks(uint32_t channel_index);
+
+static void print_channel_report(
+    uint32_t channel_index,
+    const RxAmplitudeResult *amplitude,
+    uint8_t amplitude_ok,
+    const RxPhaseResult *phase);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
 /* USER CODE END 0 */
 
 /**
@@ -134,52 +231,110 @@ static int32_t wrap_to_signed_period(int32_t ticks);
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
-  /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM1_Init();
   MX_TIM3_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
+  MX_ADC2_Init();
+
   /* USER CODE BEGIN 2 */
 
-  const char boot_msg[] = "PAT STM32 started\r\n";
-  HAL_UART_Transmit(&huart2, (uint8_t *)boot_msg, sizeof(boot_msg) - 1, HAL_MAX_DELAY);
+  /*
+   * Verbose startup text temporarily disabled.
+   * Keep UART output limited to CHx amplitude + phase.
+   */
+#if 0
+  const char boot_message[] =
+      "\r\n"
+      "PAT STM32 4-channel buffered receiver started\r\n"
+      "PA8  TIM1_CH1 = 40 kHz transmit/reference PWM\r\n"
+      "PA6  TIM3_CH1 = RX1 comparator\r\n"
+      "PA7  TIM3_CH2 = RX2 comparator\r\n"
+      "PB0  TIM3_CH3 = RX3 comparator\r\n"
+      "PB7  TIM3_CH4 = RX4 comparator\r\n"
+      "PA0  ADC1_IN1  = CH1_TO_ADC\r\n"
+      "PA1  ADC1_IN2  = CH2_TO_ADC\r\n"
+      "PA4  ADC2_IN17 = CH3_TO_ADC\r\n"
+      "PA5  ADC2_IN13 = CH4_TO_ADC\r\n";
 
-  /* ADC calibration for single-ended input */
-  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  HAL_UART_Transmit(
+      &huart2,
+      (uint8_t *)boot_message,
+      sizeof(boot_message) - 1U,
+      HAL_MAX_DELAY);
+#endif
+
+  /* Calibrate both ADCs for single-ended operation. */
+  if (HAL_ADCEx_Calibration_Start(
+          &hadc1,
+          ADC_SINGLE_ENDED) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_ADCEx_Calibration_Start(
+          &hadc2,
+          ADC_SINGLE_ENDED) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /*
-  * Start input capture first, then PWM.
-  * TIM1 generates 40 kHz on PA8.
-  * TIM3 captures phase on PA6.
-  */
-  HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+   * TIM3 must already be configured in CubeMX as:
+   *   Slave Mode = Reset Mode
+   *   Trigger    = ITR0 / TIM1_TRGO
+   *
+   * Start all four receiver captures before starting the 40 kHz PWM.
+   */
+  __HAL_TIM_SET_COUNTER(&htim3, 0U);
 
-  printf("TIM1 PA8 PWM 40kHz\r\n");
-  printf("TIM3 PA6 input capture CH1\r\n");
-  printf("PA0 envelope via 1M/470k divider, PA1 bias direct\r\n");
+  if (HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /*
+   * TIM1_CH1 is both the transmitter PWM output and the phase reference.
+   * TIM1 TRGO must be configured as Update Event in CubeMX.
+   */
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* printf("4-channel acquisition active\r\n"); */
 
   /* USER CODE END 2 */
 
@@ -187,195 +342,87 @@ int main(void)
   BSP_LED_Init(LED_GREEN);
 
   /* Infinite loop */
-/* USER CODE BEGIN WHILE */
-while (1)
-{
-  /* USER CODE END WHILE */
+  /* USER CODE BEGIN WHILE */
 
-  /* USER CODE BEGIN 3 */
-  static uint32_t last_report_ms = 0;
+  uint32_t last_report_ms = 0U;
+  uint32_t previous_capture_count[RX_CHANNEL_COUNT] = {0U};
 
-  if (HAL_GetTick() - last_report_ms >= 200)
+  while (1)
   {
-      last_report_ms = HAL_GetTick();
+    uint32_t current_ms = HAL_GetTick();
 
-      uint16_t hold_raw = 0;
-      uint16_t bias_raw = 0;
-      uint8_t adc_ok = read_adc_pair_average(&hold_raw, &bias_raw);
+    if ((current_ms - last_report_ms) >= REPORT_INTERVAL_MS)
+    {
+      last_report_ms = current_ms;
 
-      /*
-       * PA0 / hold / envelope:
-       *   This input goes through a 1M + 470k divider,
-       *   so convert it back to the original envelope voltage.
-       *
-       * PA1 / bias / virtual GND:
-       *   This input is connected directly with no divider,
-       *   so use the normal ADC voltage conversion.
-       */
-      uint32_t vhold_mV = adc_raw_to_envelope_mv(hold_raw);
-      uint32_t vbias_mV = adc_raw_to_adc_mv(bias_raw);
+      RxAmplitudeResult amplitude[RX_CHANNEL_COUNT] = {{0}};
+      uint8_t amplitude_ok[RX_CHANNEL_COUNT] = {0U};
+      RxPhaseResult phase[RX_CHANNEL_COUNT] = {{0}};
 
-      /*
-       * amplitude = envelope peak - bias
-       */
-      int32_t vpeak_mV_signed = (int32_t)vhold_mV - (int32_t)vbias_mV - PEAK_ZERO_OFFSET_MV;
-      if (vpeak_mV_signed < 0)
+      if (capture_adc_block() != 0U)
       {
-          vpeak_mV_signed = 0;
+        amplitude_ok[0] = analyse_interleaved_channel(
+            adc1_dma_buffer,
+            ADC_DMA_LENGTH,
+            0U,
+            &amplitude[0]);
+
+        amplitude_ok[1] = analyse_interleaved_channel(
+            adc1_dma_buffer,
+            ADC_DMA_LENGTH,
+            1U,
+            &amplitude[1]);
+
+        amplitude_ok[2] = analyse_interleaved_channel(
+            adc2_dma_buffer,
+            ADC_DMA_LENGTH,
+            0U,
+            &amplitude[2]);
+
+        amplitude_ok[3] = analyse_interleaved_channel(
+            adc2_dma_buffer,
+            ADC_DMA_LENGTH,
+            1U,
+            &amplitude[3]);
       }
 
-      uint32_t vpeak_mV = (uint32_t)vpeak_mV_signed;
+      snapshot_phase_state(
+          phase,
+          previous_capture_count);
 
-      uint32_t raw_ticks_local = 0;
-      uint32_t cap_count_local = 0;
-      uint8_t has_capture = 0;
-
-      __disable_irq();
-      if (ic1_new_data)
+      for (uint32_t channel = 0U;
+           channel < RX_CHANNEL_COUNT;
+           channel++)
       {
-          raw_ticks_local = ic1_raw_ticks;
-          cap_count_local = ic1_count;
-          ic1_new_data = 0;
-          has_capture = 1;
+        /* Require a non-clipped, non-trivial waveform for phase validity. */
+        uint8_t amplitude_valid =
+            ((amplitude_ok[channel] != 0U)
+             && (amplitude[channel].clipping == 0U)
+             && (amplitude[channel].buffer_rms_mV
+                 >= MIN_VALID_BUFFER_RMS_MV))
+                ? 1U
+                : 0U;
+
+        phase[channel].phase_valid =
+            ((phase[channel].has_capture != 0U)
+             && (phase[channel].raw_ticks < PAT_PERIOD_TICKS)
+             && (phase[channel].edge_rate_valid != 0U)
+             && (amplitude_valid != 0U))
+                ? 1U
+                : 0U;
+
+        print_channel_report(
+            channel,
+            &amplitude[channel],
+            amplitude_ok[channel],
+            &phase[channel]);
       }
-      else
-      {
-          cap_count_local = ic1_count;
-      }
-      __enable_irq();
+    }
 
-      int32_t phase_mdeg = 0;
-
-      if (has_capture)
-      {
-          int32_t raw_ticks = (int32_t)(raw_ticks_local % PAT_PERIOD_TICKS);
-          int32_t corrected_ticks = wrap_to_signed_period(raw_ticks - ZERO_OFFSET_TICKS);
-
-          /*
-           * phase_mdeg = phase in milli-degrees.
-           * 1000 mdeg = 1 degree.
-           */
-          phase_mdeg = (corrected_ticks * 360000L) / (int32_t)PAT_PERIOD_TICKS;
-      }
-
-      /*
-       * New compact output:
-       * Only amplitude and phase.
-       */
-      char msg[96];
-
-      if (has_capture && adc_ok)
-      {
-          int32_t phase_abs = phase_mdeg;
-          const char *phase_sign = "";
-
-          if (phase_abs < 0)
-          {
-              phase_abs = -phase_abs;
-              phase_sign = "-";
-          }
-
-          int n = snprintf(msg, sizeof(msg),
-                           "amp_mV=%lu,phase_deg=%s%ld.%03ld\r\n",
-                           vpeak_mV,
-                           phase_sign,
-                           phase_abs / 1000,
-                           phase_abs % 1000);
-
-          if (n > 0)
-          {
-              HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)n, 100);
-          }
-      }
-      else if (!has_capture && adc_ok)
-      {
-          int n = snprintf(msg, sizeof(msg),
-                           "amp_mV=%lu,phase_deg=no_capture\r\n",
-                           vpeak_mV);
-
-          if (n > 0)
-          {
-              HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)n, 100);
-          }
-      }
-      else
-      {
-          int n = snprintf(msg, sizeof(msg),
-                           "amp_mV=adc_error,phase_deg=no_data\r\n");
-
-          if (n > 0)
-          {
-              HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)n, 100);
-          }
-      }
-
-#if 0
-      /*
-       * Old verbose debug output.
-       * Keep this commented out. Re-enable only when debugging.
-       */
-
-      uint32_t vpp_mV   = 2UL * vpeak_mV;
-      uint32_t vrms_mV  = (vpeak_mV * 707UL) / 1000UL;
-
-      uint32_t p_cPa = 0;
-      uint64_t denom = (uint64_t)RX_SENS_UV_PER_PA * (uint64_t)AMP_GAIN_X1000;
-
-      if (denom > 0)
-      {
-          p_cPa = (uint32_t)(((uint64_t)vrms_mV * 100000000ULL) / denom);
-      }
-
-      int32_t raw_ticks = (int32_t)(raw_ticks_local % PAT_PERIOD_TICKS);
-      int32_t corrected_ticks = wrap_to_signed_period(raw_ticks - ZERO_OFFSET_TICKS);
-      int32_t dt_ns = (corrected_ticks * 1000L) / TIMER_CLOCK_MHZ;
-
-      char debug_msg[320];
-      int debug_n;
-
-      if (has_capture)
-      {
-          debug_n = snprintf(debug_msg, sizeof(debug_msg),
-                             "holdRaw=%u,biasRaw=%u,Vhold_mV=%lu,Vbias_mV=%lu,Vpeak_mV=%lu,Vpp_mV=%lu,Vrms_mV=%lu,p_cPa=%lu,rawTicks=%ld,correctedTicks=%ld,dt_ns=%ld,phase_mdeg=%ld,capCount=%lu,adc_ok=%u\r\n",
-                             hold_raw,
-                             bias_raw,
-                             vhold_mV,
-                             vbias_mV,
-                             vpeak_mV,
-                             vpp_mV,
-                             vrms_mV,
-                             p_cPa,
-                             raw_ticks,
-                             corrected_ticks,
-                             dt_ns,
-                             phase_mdeg,
-                             cap_count_local,
-                             adc_ok);
-      }
-      else
-      {
-          debug_n = snprintf(debug_msg, sizeof(debug_msg),
-                             "holdRaw=%u,biasRaw=%u,Vhold_mV=%lu,Vbias_mV=%lu,Vpeak_mV=%lu,Vpp_mV=%lu,Vrms_mV=%lu,p_cPa=%lu,no_capture,capCount=%lu,adc_ok=%u\r\n",
-                             hold_raw,
-                             bias_raw,
-                             vhold_mV,
-                             vbias_mV,
-                             vpeak_mV,
-                             vpp_mV,
-                             vrms_mV,
-                             p_cPa,
-                             cap_count_local,
-                             adc_ok);
-      }
-
-      if (debug_n > 0)
-      {
-          HAL_UART_Transmit(&huart2, (uint8_t *)debug_msg, (uint16_t)debug_n, 100);
-      }
-#endif
+    /* USER CODE END WHILE */
+    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
-}
 }
 
 /**
@@ -404,6 +451,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -426,147 +474,533 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+/**
+  * @brief TIM3 input-capture callback for RX1..RX4.
+  */
+void HAL_TIM_IC_CaptureCallback(
+    TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM3)
-    {
-        if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
-        {
-            ic1_raw_ticks = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-            ic1_count++;
-            ic1_new_data = 1;
-        }
-    }
+  if (htim->Instance != TIM3)
+  {
+    return;
+  }
+
+  uint32_t index;
+  uint32_t channel;
+
+  switch (htim->Channel)
+  {
+    case HAL_TIM_ACTIVE_CHANNEL_1:
+      index = 0U;
+      channel = TIM_CHANNEL_1;
+      break;
+
+    case HAL_TIM_ACTIVE_CHANNEL_2:
+      index = 1U;
+      channel = TIM_CHANNEL_2;
+      break;
+
+    case HAL_TIM_ACTIVE_CHANNEL_3:
+      index = 2U;
+      channel = TIM_CHANNEL_3;
+      break;
+
+    case HAL_TIM_ACTIVE_CHANNEL_4:
+      index = 3U;
+      channel = TIM_CHANNEL_4;
+      break;
+
+    default:
+      return;
+  }
+
+  rx_raw_ticks[index] =
+      HAL_TIM_ReadCapturedValue(
+          htim,
+          channel);
+
+  rx_capture_count[index]++;
+  rx_new_data[index] = 1U;
 }
 
-static uint8_t read_adc_pair_once(uint16_t *hold, uint16_t *bias)
+/**
+  * @brief ADC DMA conversion-complete callback.
+  */
+void HAL_ADC_ConvCpltCallback(
+    ADC_HandleTypeDef *hadc)
 {
-    HAL_StatusTypeDef status;
-
-    status = HAL_ADC_Start(&hadc1);
-    if (status != HAL_OK)
-    {
-        return 0;
-    }
-
-    status = HAL_ADC_PollForConversion(&hadc1, 10);
-    if (status != HAL_OK)
-    {
-        HAL_ADC_Stop(&hadc1);
-        return 0;
-    }
-
-    *hold = (uint16_t)HAL_ADC_GetValue(&hadc1);
-
-    status = HAL_ADC_PollForConversion(&hadc1, 10);
-    if (status != HAL_OK)
-    {
-        HAL_ADC_Stop(&hadc1);
-        return 0;
-    }
-
-    *bias = (uint16_t)HAL_ADC_GetValue(&hadc1);
-
-    HAL_ADC_Stop(&hadc1);
-    return 1;
+  if (hadc->Instance == ADC1)
+  {
+    adc1_capture_done = 1U;
+  }
+  else if (hadc->Instance == ADC2)
+  {
+    adc2_capture_done = 1U;
+  }
 }
 
-static uint8_t read_adc_pair_average(uint16_t *hold, uint16_t *bias)
+/**
+  * @brief ADC DMA error callback.
+  */
+void HAL_ADC_ErrorCallback(
+    ADC_HandleTypeDef *hadc)
 {
-    const uint8_t samples = 16;
+  if (hadc->Instance == ADC1)
+  {
+    adc1_capture_error = 1U;
+  }
+  else if (hadc->Instance == ADC2)
+  {
+    adc2_capture_error = 1U;
+  }
+}
 
-    uint32_t hold_sum = 0;
-    uint32_t bias_sum = 0;
+/**
+  * @brief Capture one four-channel waveform block using ADC1 + ADC2 DMA.
+  * @retval 1 on success, 0 on timeout or HAL error.
+  */
+static uint8_t capture_adc_block(void)
+{
+  adc1_capture_done = 0U;
+  adc2_capture_done = 0U;
+  adc1_capture_error = 0U;
+  adc2_capture_error = 0U;
 
-    for (uint8_t i = 0; i < samples; i++)
+  /* Make repeated captures deterministic. */
+  HAL_ADC_Stop_DMA(&hadc1);
+  HAL_ADC_Stop_DMA(&hadc2);
+
+  /*
+   * Start ADC2 first, then ADC1.  Exact alignment is not required for the
+   * RMS calculation; phase comes from TIM3 comparator captures.
+   */
+  if (HAL_ADC_Start_DMA(
+          &hadc2,
+          (uint32_t *)adc2_dma_buffer,
+          ADC_DMA_LENGTH) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  if (HAL_ADC_Start_DMA(
+          &hadc1,
+          (uint32_t *)adc1_dma_buffer,
+          ADC_DMA_LENGTH) != HAL_OK)
+  {
+    HAL_ADC_Stop_DMA(&hadc2);
+    return 0U;
+  }
+
+  uint32_t start_ms = HAL_GetTick();
+
+  while (((adc1_capture_done == 0U)
+          || (adc2_capture_done == 0U))
+         && (adc1_capture_error == 0U)
+         && (adc2_capture_error == 0U))
+  {
+    if ((HAL_GetTick() - start_ms)
+        >= ADC_CAPTURE_TIMEOUT_MS)
     {
-        uint16_t h = 0;
-        uint16_t b = 0;
+      HAL_ADC_Stop_DMA(&hadc1);
+      HAL_ADC_Stop_DMA(&hadc2);
+      return 0U;
+    }
+  }
 
-        if (!read_adc_pair_once(&h, &b))
-        {
-            return 0;
-        }
+  HAL_ADC_Stop_DMA(&hadc1);
+  HAL_ADC_Stop_DMA(&hadc2);
 
-        hold_sum += h;
-        bias_sum += b;
+  if ((adc1_capture_error != 0U)
+      || (adc2_capture_error != 0U)
+      || (adc1_capture_done == 0U)
+      || (adc2_capture_done == 0U))
+  {
+    return 0U;
+  }
+
+  return 1U;
+}
+
+/**
+  * @brief Analyse one channel inside a two-rank interleaved DMA buffer.
+  *
+  * The DC bias is removed mathematically before AC RMS is calculated.
+  * channel_offset must be 0 or 1.
+  */
+static uint8_t analyse_interleaved_channel(
+    const uint16_t *buffer,
+    uint32_t buffer_length,
+    uint32_t channel_offset,
+    RxAmplitudeResult *result)
+{
+  if ((buffer == NULL)
+      || (result == NULL)
+      || (buffer_length < 2U)
+      || (channel_offset >= ADC_CHANNELS_PER_ADC))
+  {
+    return 0U;
+  }
+
+  uint32_t count = 0U;
+  uint64_t sum = 0ULL;
+  uint64_t sum_squared = 0ULL;
+  uint16_t sample_min = (uint16_t)ADC_MAX_COUNTS;
+  uint16_t sample_max = 0U;
+
+  for (uint32_t i = channel_offset;
+       i < buffer_length;
+       i += ADC_CHANNELS_PER_ADC)
+  {
+    uint32_t sample = buffer[i];
+
+    sum += sample;
+    sum_squared +=
+        (uint64_t)sample * (uint64_t)sample;
+    count++;
+
+    if (sample < sample_min)
+    {
+      sample_min = (uint16_t)sample;
     }
 
-    *hold = (uint16_t)(hold_sum / samples);
-    *bias = (uint16_t)(bias_sum / samples);
+    if (sample > sample_max)
+    {
+      sample_max = (uint16_t)sample;
+    }
+  }
 
-    return 1;
+  if (count == 0U)
+  {
+    return 0U;
+  }
+
+  uint64_t count_u64 = (uint64_t)count;
+
+  /*
+   * Centered energy:
+   *   E = N*sum(x^2) - sum(x)^2
+   *   RMS_counts = sqrt(E) / N
+   *
+   * x1000 keeps sub-count precision without floating point.
+   */
+  uint64_t centered_energy =
+      count_u64 * sum_squared
+      - sum * sum;
+
+  uint64_t rms_counts_x1000 =
+      integer_sqrt_u64(
+          centered_energy * 1000000ULL)
+      / count_u64;
+
+  uint64_t buffer_dc_mV =
+      sum * ADC_VREF_MV
+      / (count_u64 * ADC_MAX_COUNTS);
+
+  uint64_t buffer_rms_mV =
+      rms_counts_x1000 * ADC_VREF_MV
+      / (ADC_MAX_COUNTS * 1000ULL);
+
+  uint64_t buffer_vpp_mV =
+      (uint64_t)(sample_max - sample_min)
+      * ADC_VREF_MV
+      / ADC_MAX_COUNTS;
+
+  uint64_t amp_rms_mV =
+      buffer_rms_mV
+      * ADC_DIV_RESTORE_NUMERATOR
+      / ADC_DIV_RESTORE_DENOMINATOR;
+
+  uint64_t amp_vpp_mV =
+      buffer_vpp_mV
+      * ADC_DIV_RESTORE_NUMERATOR
+      / ADC_DIV_RESTORE_DENOMINATOR;
+
+  result->adc_min = sample_min;
+  result->adc_max = sample_max;
+  result->buffer_dc_mV = (uint32_t)buffer_dc_mV;
+  result->buffer_rms_mV = (uint32_t)buffer_rms_mV;
+  result->buffer_vpp_mV = (uint32_t)buffer_vpp_mV;
+  result->amp_rms_mV = (uint32_t)amp_rms_mV;
+  result->amp_vpp_mV = (uint32_t)amp_vpp_mV;
+
+  result->clipping =
+      ((sample_min <= ADC_CLIP_LOW_COUNTS)
+       || (sample_max >= ADC_CLIP_HIGH_COUNTS))
+          ? 1U
+          : 0U;
+
+  /*
+   * Approximate acoustic pressure from the restored amplifier-output RMS.
+   * Result is centi-Pascal (100 cPa = 1 Pa).
+   */
+  uint64_t pressure_denominator =
+      (uint64_t)RX_SENS_UV_PER_PA
+      * (uint64_t)AMP_GAIN_X1000;
+
+  if (pressure_denominator != 0ULL)
+  {
+    result->pressure_cPa =
+        (uint32_t)(
+            amp_rms_mV * 100000000ULL
+            / pressure_denominator);
+  }
+  else
+  {
+    result->pressure_cPa = 0U;
+  }
+
+  return 1U;
 }
 
-static uint32_t adc_raw_to_adc_mv(uint16_t raw)
+/**
+  * @brief Atomically snapshot all four phase channels and calculate phase.
+  */
+static void snapshot_phase_state(
+    RxPhaseResult phase[RX_CHANNEL_COUNT],
+    uint32_t previous_count[RX_CHANNEL_COUNT])
 {
-    return ((uint32_t)raw * ADC_VREF_MV) / ADC_MAX_COUNTS;
+  uint32_t ticks_local[RX_CHANNEL_COUNT];
+  uint32_t count_local[RX_CHANNEL_COUNT];
+  uint8_t new_data_local[RX_CHANNEL_COUNT];
+
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+
+  for (uint32_t channel = 0U;
+       channel < RX_CHANNEL_COUNT;
+       channel++)
+  {
+    ticks_local[channel] = rx_raw_ticks[channel];
+    count_local[channel] = rx_capture_count[channel];
+    new_data_local[channel] = rx_new_data[channel];
+    rx_new_data[channel] = 0U;
+  }
+
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+
+  for (uint32_t channel = 0U;
+       channel < RX_CHANNEL_COUNT;
+       channel++)
+  {
+    phase[channel].raw_ticks = ticks_local[channel];
+    phase[channel].capture_count = count_local[channel];
+    phase[channel].capture_delta =
+        count_local[channel] - previous_count[channel];
+    previous_count[channel] = count_local[channel];
+    phase[channel].has_capture = new_data_local[channel];
+
+    phase[channel].edge_rate_valid =
+        ((phase[channel].capture_delta >= MIN_VALID_CAPTURE_DELTA)
+         && (phase[channel].capture_delta <= MAX_VALID_CAPTURE_DELTA))
+            ? 1U
+            : 0U;
+
+    phase[channel].corrected_ticks = 0L;
+    phase[channel].delay_ns = 0L;
+    phase[channel].phase_mdeg = 0L;
+    phase[channel].phase_valid = 0U;
+
+    if ((phase[channel].has_capture != 0U)
+        && (phase[channel].raw_ticks < PAT_PERIOD_TICKS))
+    {
+      phase[channel].corrected_ticks =
+          wrap_to_signed_period(
+              (int32_t)phase[channel].raw_ticks
+              - phase_zero_offset_ticks(channel));
+
+      phase[channel].phase_mdeg =
+          (phase[channel].corrected_ticks * 360000L)
+          / (int32_t)PAT_PERIOD_TICKS;
+
+      phase[channel].delay_ns =
+          (phase[channel].corrected_ticks * 1000L)
+          / TIMER_CLOCK_MHZ;
+    }
+  }
 }
 
-static uint32_t adc_raw_to_envelope_mv(uint16_t raw)
+/**
+  * @brief Print one compact UART report line.
+  */
+static void print_channel_report(
+    uint32_t channel_index,
+    const RxAmplitudeResult *amplitude,
+    uint8_t amplitude_ok,
+    const RxPhaseResult *phase)
 {
-    uint32_t pa0_mv = adc_raw_to_adc_mv(raw);
+  char message[96];
+  int length;
 
-    return (pa0_mv * (ENV_DIV_TOP_OHM + ENV_DIV_BOTTOM_OHM)) / ENV_DIV_BOTTOM_OHM;
+  if ((amplitude == NULL) || (phase == NULL))
+  {
+    return;
+  }
+
+  /*
+   * Minimal UART report for now:
+   *   CHx,amplitude=<amplifier-output RMS mV>,phase=<degrees>
+   *
+   * amp_rms_mV is restored to the signal level before the 10k/15k divider.
+   */
+  if (amplitude_ok == 0U)
+  {
+    length = snprintf(
+        message,
+        sizeof(message),
+        "CH%lu,amplitude=adc_error,phase=invalid\r\n",
+        (unsigned long)(channel_index + 1U));
+  }
+  else if (phase->phase_valid == 0U)
+  {
+    length = snprintf(
+        message,
+        sizeof(message),
+        "CH%lu,amplitude=%lu mV RMS,phase=invalid\r\n",
+        (unsigned long)(channel_index + 1U),
+        (unsigned long)amplitude->amp_rms_mV);
+  }
+  else
+  {
+    int32_t phase_absolute = phase->phase_mdeg;
+    const char *phase_sign = "";
+
+    if (phase_absolute < 0L)
+    {
+      phase_absolute = -phase_absolute;
+      phase_sign = "-";
+    }
+
+    length = snprintf(
+        message,
+        sizeof(message),
+        "CH%lu,amplitude=%lu mV RMS,phase=%s%ld.%03ld deg\r\n",
+        (unsigned long)(channel_index + 1U),
+        (unsigned long)amplitude->amp_rms_mV,
+        phase_sign,
+        (long)(phase_absolute / 1000L),
+        (long)(phase_absolute % 1000L));
+  }
+
+  if (length > 0)
+  {
+    if (length > (int)(sizeof(message) - 1U))
+    {
+      length = (int)(sizeof(message) - 1U);
+    }
+
+    HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)message,
+        (uint16_t)length,
+        100U);
+  }
+
+#if 0
+  /*
+   * Verbose UART fields temporarily disabled:
+   * bufDC, bufRMS, bufVpp, ampVpp, p_rms,
+   * adcMin, adcMax, clip, rawTicks, correctedTicks, dt,
+   * phaseValid, capCount and capDelta.
+   */
+#endif
 }
 
+/**
+  * @brief Return the calibration offset for one receiver channel.
+  */
+static int32_t phase_zero_offset_ticks(uint32_t channel_index)
+{
+  switch (channel_index)
+  {
+    case 0U:
+      return RX1_ZERO_OFFSET_TICKS;
+
+    case 1U:
+      return RX2_ZERO_OFFSET_TICKS;
+
+    case 2U:
+      return RX3_ZERO_OFFSET_TICKS;
+
+    case 3U:
+      return RX4_ZERO_OFFSET_TICKS;
+
+    default:
+      return 0L;
+  }
+}
+
+/**
+  * @brief Integer square root for a 64-bit unsigned value.
+  */
+static uint64_t integer_sqrt_u64(uint64_t value)
+{
+  uint64_t result = 0ULL;
+  uint64_t bit = 1ULL << 62;
+
+  while (bit > value)
+  {
+    bit >>= 2;
+  }
+
+  while (bit != 0ULL)
+  {
+    if (value >= result + bit)
+    {
+      value -= result + bit;
+      result = (result >> 1) + bit;
+    }
+    else
+    {
+      result >>= 1;
+    }
+
+    bit >>= 2;
+  }
+
+  return result;
+}
+
+/**
+  * @brief Wrap timer ticks to approximately -180 to +180 degrees.
+  */
 static int32_t wrap_to_signed_period(int32_t ticks)
 {
-    while (ticks > (int32_t)(PAT_PERIOD_TICKS / 2))
-    {
-        ticks -= PAT_PERIOD_TICKS;
-    }
+  while (ticks >= (int32_t)(PAT_PERIOD_TICKS / 2UL))
+  {
+    ticks -= (int32_t)PAT_PERIOD_TICKS;
+  }
 
-    while (ticks < -(int32_t)(PAT_PERIOD_TICKS / 2))
-    {
-        ticks += PAT_PERIOD_TICKS;
-    }
+  while (ticks < -(int32_t)(PAT_PERIOD_TICKS / 2UL))
+  {
+    ticks += (int32_t)PAT_PERIOD_TICKS;
+  }
 
-    return ticks;
+  return ticks;
 }
 
-int _write(int file, char *ptr, int len)
+/**
+  * @brief Redirect printf to USART2.
+  */
+int _write(
+    int file,
+    char *pointer,
+    int length)
 {
-    HAL_UART_Transmit(&huart2, (uint8_t *)ptr, len, HAL_MAX_DELAY);
-    return len;
+  (void)file;
+
+  HAL_UART_Transmit(
+      &huart2,
+      (uint8_t *)pointer,
+      (uint16_t)length,
+      HAL_MAX_DELAY);
+
+  return length;
 }
 
 /* USER CODE END 4 */
-
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * STM32 PAT receiver migration user code sections
-  * Target: NUCLEO-G431KB / STM32G431KBTx
-  * CubeMX config assumed:
-  *   TIM1_CH1 PA8 PWM 40 kHz, ARR=4249, CCR1=2125, TRGO=Update Event
-  *   TIM3_CH1 PA6 Input Capture, ARR=4249, Reset Mode, Trigger=ITR0/TIM1_TRGO, IRQ enabled
-  *   ADC1 regular sequence: Rank1=ADC1_IN1/PA0, Rank2=ADC1_IN2/PA1, single-ended
-  *   USART2 PA2/PA3 115200 8N1 VCP
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-
-/**
-  * @}
-  */
-
-/**
-  * @}
-  */
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -575,26 +1009,27 @@ int _write(int file, char *ptr, int len)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
+
   while (1)
   {
   }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.
   * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
+  * @param  line: source line number
   * @retval None
   */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  (void)file;
+  (void)line;
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
