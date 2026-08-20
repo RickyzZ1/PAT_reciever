@@ -2,15 +2,17 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : PAT 4-channel buffered-waveform receiver
+  * @brief          : PAT 3-channel calibration logger (RX1-RX3)
   ******************************************************************************
   *
   * Target:
   *   NUCLEO-G431KB / STM32G431KBTx
   *
-  * 40 kHz transmit/reference:
-  *   PA8 / TIM1_CH1 = 40 kHz PWM
-  *   TIM1 TRGO      = Update Event
+  * External 40 kHz PAT reference:
+  *   PA8 / TIM1_CH1 = PAT_REF input capture
+  *   TIM1 slave mode = Reset Mode
+  *   TIM1 trigger    = TI1FP1
+  *   TIM1 TRGO       = Update Event
   *
   * Phase capture:
   *   TIM3 slave mode = Reset Mode
@@ -19,7 +21,7 @@
   *   PA6 / TIM3_CH1 = RX1 comparator
   *   PA7 / TIM3_CH2 = RX2 comparator
   *   PB0 / TIM3_CH3 = RX3 comparator
-  *   PB7 / TIM3_CH4 = RX4 comparator
+  *   PB7 / TIM3_CH4 = RX4 comparator (not used in calibration mode)
   *
   * Buffered waveform ADC inputs:
   *   PA0 / ADC1_IN1  = CH1_TO_ADC
@@ -101,6 +103,7 @@ typedef struct
 /* USER CODE BEGIN PD */
 
 #define RX_CHANNEL_COUNT              4U
+#define CAL_RX_CHANNEL_COUNT          3U
 
 /*
  * TIM1/TIM3 timer clock = 170 MHz.
@@ -161,7 +164,7 @@ typedef struct
 #define AMP_GAIN_X1000                3200UL
 
 /* Optional validity checks. */
-#define MIN_VALID_BUFFER_RMS_MV       5UL
+#define MIN_VALID_BUFFER_RMS_MV       15UL
 #define MIN_VALID_CAPTURE_DELTA       7000UL
 #define MAX_VALID_CAPTURE_DELTA       9000UL
 
@@ -213,11 +216,9 @@ static uint64_t integer_sqrt_u64(uint64_t value);
 static int32_t wrap_to_signed_period(int32_t ticks);
 static int32_t phase_zero_offset_ticks(uint32_t channel_index);
 
-static void print_channel_report(
-    uint32_t channel_index,
-    const RxAmplitudeResult *amplitude,
-    uint8_t amplitude_ok,
-    const RxPhaseResult *phase);
+static void print_calibration_report(
+    const RxAmplitudeResult amplitude[RX_CHANNEL_COUNT],
+    const RxPhaseResult phase[RX_CHANNEL_COUNT]);
 
 /* USER CODE END PFP */
 
@@ -263,8 +264,8 @@ int main(void)
 #if 0
   const char boot_message[] =
       "\r\n"
-      "PAT STM32 4-channel buffered receiver started\r\n"
-      "PA8  TIM1_CH1 = 40 kHz transmit/reference PWM\r\n"
+      "PAT STM32 3-channel calibration receiver started\r\n"
+      "PA8  TIM1_CH1 = external PAT_REF input\r\n"
       "PA6  TIM3_CH1 = RX1 comparator\r\n"
       "PA7  TIM3_CH2 = RX2 comparator\r\n"
       "PB0  TIM3_CH3 = RX3 comparator\r\n"
@@ -297,11 +298,15 @@ int main(void)
   }
 
   /*
-   * TIM3 must already be configured in CubeMX as:
-   *   Slave Mode = Reset Mode
-   *   Trigger    = ITR0 / TIM1_TRGO
+   * Phase timing architecture:
    *
-   * Start all four receiver captures before starting the 40 kHz PWM.
+   *   PAT_REF -> PA8 / TIM1_CH1 input capture
+   *           -> TIM1 Reset Mode, trigger TI1FP1
+   *           -> TIM1 TRGO (Update Event)
+   *           -> TIM3 ITR0, Reset Mode
+   *           -> TIM3_CH1/2/3 capture RX1/RX2/RX3 comparator edges
+   *
+   * Start the receiver capture channels first, then enable PAT_REF last.
    */
   __HAL_TIM_SET_COUNTER(&htim3, 0U);
 
@@ -320,21 +325,19 @@ int main(void)
     Error_Handler();
   }
 
-  if (HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_4) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  /*
+   * RX4 is intentionally excluded from calibration mode.  ADC2 still scans
+   * CH3 + CH4 as configured, but TIM3_CH4 capture is not started.
+   */
 
   /*
-   * TIM1_CH1 is both the transmitter PWM output and the phase reference.
-   * TIM1 TRGO must be configured as Update Event in CubeMX.
+   * Enable the external PAT_REF input.  No interrupt is needed on TIM1_CH1;
+   * the timer-to-timer synchronization path operates fully in hardware.
    */
-  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
+  if (HAL_TIM_IC_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
-
-  /* printf("4-channel acquisition active\r\n"); */
 
   /* USER CODE END 2 */
 
@@ -379,11 +382,8 @@ int main(void)
             0U,
             &amplitude[2]);
 
-        amplitude_ok[3] = analyse_interleaved_channel(
-            adc2_dma_buffer,
-            ADC_DMA_LENGTH,
-            1U,
-            &amplitude[3]);
+        /* ADC2 still acquires CH4 as rank 2; calibration mode ignores it. */
+        amplitude_ok[3] = 0U;
       }
 
       snapshot_phase_state(
@@ -391,10 +391,14 @@ int main(void)
           previous_capture_count);
 
       for (uint32_t channel = 0U;
-           channel < RX_CHANNEL_COUNT;
+           channel < CAL_RX_CHANNEL_COUNT;
            channel++)
       {
-        /* Require a non-clipped, non-trivial waveform for phase validity. */
+        /*
+         * Accept phase only when the analogue waveform is clearly above the
+         * measured idle noise floor, the ADC is not clipped, and the comparator
+         * edge rate is consistent with approximately 40 kHz.
+         */
         uint8_t amplitude_valid =
             ((amplitude_ok[channel] != 0U)
              && (amplitude[channel].clipping == 0U)
@@ -410,13 +414,14 @@ int main(void)
              && (amplitude_valid != 0U))
                 ? 1U
                 : 0U;
-
-        print_channel_report(
-            channel,
-            &amplitude[channel],
-            amplitude_ok[channel],
-            &phase[channel]);
       }
+
+      /*
+       * One CSV record per measurement snapshot.
+       * Format:
+       * CAL,amp1_mV,phase1_mdeg,amp2_mV,phase2_mdeg,amp3_mV,phase3_mdeg
+       */
+      print_calibration_report(amplitude, phase);
     }
 
     /* USER CODE END WHILE */
@@ -475,7 +480,7 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief TIM3 input-capture callback for RX1..RX4.
+  * @brief TIM3 input-capture callback for receiver comparator channels.
   */
 void HAL_TIM_IC_CaptureCallback(
     TIM_HandleTypeDef *htim)
@@ -753,7 +758,7 @@ static uint8_t analyse_interleaved_channel(
 }
 
 /**
-  * @brief Atomically snapshot all four phase channels and calculate phase.
+  * @brief Atomically snapshot receiver phase state and calculate phase.
   */
 static void snapshot_phase_state(
     RxPhaseResult phase[RX_CHANNEL_COUNT],
@@ -823,66 +828,46 @@ static void snapshot_phase_state(
 }
 
 /**
-  * @brief Print one compact UART report line.
+  * @brief Print one RX1-RX3 calibration CSV record.
+  *
+  * A record is emitted only when all three calibration receivers have a valid
+  * phase measurement.  Amplitude is amplifier-output RMS in mV.  Phase is kept
+  * as integer millidegrees so host-side parsing stays simple and lossless.
+  *
+  * Format:
+  *   CAL,amp1_mV,phase1_mdeg,amp2_mV,phase2_mdeg,amp3_mV,phase3_mdeg
   */
-static void print_channel_report(
-    uint32_t channel_index,
-    const RxAmplitudeResult *amplitude,
-    uint8_t amplitude_ok,
-    const RxPhaseResult *phase)
+static void print_calibration_report(
+    const RxAmplitudeResult amplitude[RX_CHANNEL_COUNT],
+    const RxPhaseResult phase[RX_CHANNEL_COUNT])
 {
-  char message[96];
-  int length;
-
   if ((amplitude == NULL) || (phase == NULL))
   {
     return;
   }
 
-  /*
-   * Minimal UART report for now:
-   *   CHx,amplitude=<amplifier-output RMS mV>,phase=<degrees>
-   *
-   * amp_rms_mV is restored to the signal level before the 10k/15k divider.
-   */
-  if (amplitude_ok == 0U)
+  for (uint32_t channel = 0U;
+       channel < CAL_RX_CHANNEL_COUNT;
+       channel++)
   {
-    length = snprintf(
-        message,
-        sizeof(message),
-        "CH%lu,amplitude=adc_error,phase=invalid\r\n",
-        (unsigned long)(channel_index + 1U));
-  }
-  else if (phase->phase_valid == 0U)
-  {
-    length = snprintf(
-        message,
-        sizeof(message),
-        "CH%lu,amplitude=%lu mV RMS,phase=invalid\r\n",
-        (unsigned long)(channel_index + 1U),
-        (unsigned long)amplitude->amp_rms_mV);
-  }
-  else
-  {
-    int32_t phase_absolute = phase->phase_mdeg;
-    const char *phase_sign = "";
-
-    if (phase_absolute < 0L)
+    if (phase[channel].phase_valid == 0U)
     {
-      phase_absolute = -phase_absolute;
-      phase_sign = "-";
+      return;
     }
-
-    length = snprintf(
-        message,
-        sizeof(message),
-        "CH%lu,amplitude=%lu mV RMS,phase=%s%ld.%03ld deg\r\n",
-        (unsigned long)(channel_index + 1U),
-        (unsigned long)amplitude->amp_rms_mV,
-        phase_sign,
-        (long)(phase_absolute / 1000L),
-        (long)(phase_absolute % 1000L));
   }
+
+  char message[128];
+
+  int length = snprintf(
+      message,
+      sizeof(message),
+      "CAL,%lu,%ld,%lu,%ld,%lu,%ld\r\n",
+      (unsigned long)amplitude[0].amp_rms_mV,
+      (long)phase[0].phase_mdeg,
+      (unsigned long)amplitude[1].amp_rms_mV,
+      (long)phase[1].phase_mdeg,
+      (unsigned long)amplitude[2].amp_rms_mV,
+      (long)phase[2].phase_mdeg);
 
   if (length > 0)
   {
@@ -897,15 +882,6 @@ static void print_channel_report(
         (uint16_t)length,
         100U);
   }
-
-#if 0
-  /*
-   * Verbose UART fields temporarily disabled:
-   * bufDC, bufRMS, bufVpp, ampVpp, p_rms,
-   * adcMin, adcMax, clip, rawTicks, correctedTicks, dt,
-   * phaseValid, capCount and capDelta.
-   */
-#endif
 }
 
 /**
